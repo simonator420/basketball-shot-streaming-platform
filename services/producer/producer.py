@@ -1,14 +1,20 @@
 import os
 import json
 from dotenv import load_dotenv
-from kafka import KafkaProducer
+from confluent_kafka import Producer
 import mysql.connector
 
-load_dotenv()  # loads .env if present
+load_dotenv()
 
 def env_int(key: str, default: int) -> int:
     v = os.getenv(key, str(default))
     return int(v)
+
+def delivery_report(err, msg):
+    if err is not None:
+        print(f"Delivery failed: {err}")
+    # else:
+    #     print(f"Delivered to {msg.topic()} [{msg.partition()}] @ offset {msg.offset()}")
 
 def main():
     # --- Config from env ---
@@ -42,18 +48,20 @@ def main():
     )
     cur = conn.cursor(dictionary=True)
 
-    # --- Connect Kafka ---
-    producer = KafkaProducer(
-        bootstrap_servers=kafka_bootstrap,
-        value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
-    )
+    # --- Connect Kafka (confluent-kafka) ---
+    producer = Producer({
+        "bootstrap.servers": kafka_bootstrap,
+        # helps for local dev if broker hiccups
+        "message.timeout.ms": 30000,
+    })
 
-    # --- Fetch + send ---
     cur.execute(query)
     rows = cur.fetchall()
+
     print(f"Fetched {len(rows)} rows from MySQL ({mysql_db}.Shots).")
     print(f"Sending to Kafka topic '{topic}' on {kafka_bootstrap}...")
 
+    sent = 0
     for r in rows:
         event = {
             "event_id": r["id"],
@@ -69,13 +77,17 @@ def main():
             "score_diff_before": int(r["score_differential_before_shot"]),
             "score_diff_after": int(r["score_differential_after_shot"]),
         }
-        producer.send(topic, event)
+
+        producer.produce(topic, value=json.dumps(event, default=str), callback=delivery_report)
+        sent += 1
+
+        # let producer handle delivery queue
+        if sent % 2000 == 0:
+            producer.poll(0)
 
     producer.flush()
-    producer.close()
     cur.close()
     conn.close()
-
     print("Done")
 
 if __name__ == "__main__":

@@ -14,13 +14,33 @@ services:
     depends_on:
       - zookeeper
     ports:
-      - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
-      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092"
-      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:29092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  producer:
+    build:
+      context: ./services/producer
+    container_name: producer
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: shots_raw
+      MYSQL_HOST: host.docker.internal
+      MYSQL_PORT: 8889
+      MYSQL_USER: root
+      MYSQL_PASSWORD: root
+      MYSQL_DATABASE: basketball_optimalization
+      LIMIT_ROWS: 100
+    depends_on:
+      - kafka
