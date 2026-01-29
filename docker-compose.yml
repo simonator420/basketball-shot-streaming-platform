@@ -1,46 +1,107 @@
 services:
+  # Required by Kafka (non-KRaft mode) to manage broker metadata,
+  # leader election, and cluster coordination.
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
     environment:
+      # Port used by Kafka to connect to ZooKeeper
       ZOOKEEPER_CLIENT_PORT: 2181
+      # Basic timing configuration for ZooKeeper internals
       ZOOKEEPER_TICK_TIME: 2000
     ports:
+      # Expose ZooKeeper port to the host
       - "2181:2181"
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
+    # Ensure ZooKeeper container starts before Kafka
     depends_on:
       - zookeeper
     ports:
+      # External Kafka port exposed to the host machine
       - "29092:29092"
     environment:
+      # Unique broker ID (single-broker setup)
       KAFKA_BROKER_ID: 1
+      # ZooKeeper connection string
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
 
+      # - INTERNAL: for communication inside Docker network
+      # - EXTERNAL: for communication from host machine
       KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092"
+
+      # Addresses advertised to Kafka clients
+      # INTERNAL is used by Docker services, EXTERNAL by host clients
       KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:29092"
+
+      # Map listener names to security protocols
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+
+      # Listener used for inter-broker communication
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
 
+      # Replication settings adjusted for single-broker development setup
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # Automatically create topics if they do not exist
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
 
+  # Reads data from MySQL and publishes it as JSON events to Kafka
   producer:
     build:
       context: ./services/producer
     container_name: producer
     environment:
+      # Kafka bootstrap server inside Docker network
       KAFKA_BOOTSTRAP: kafka:9092
+      # Target Kafka topic for raw events
       KAFKA_TOPIC: shots_raw
+
+      # MySQL connection
       MYSQL_HOST: host.docker.internal
       MYSQL_PORT: 8889
       MYSQL_USER: root
       MYSQL_PASSWORD: root
       MYSQL_DATABASE: basketball_optimalization
+
+      # Limit number of rows read per run
       LIMIT_ROWS: 100
     depends_on:
+      # Ensure Kafka is running before producer starts
       - kafka
+  
+  # Consumes raw events from Kafka and writes them to S3
+  # as newline-delimited JSON in a bronze data layer
+  bronze_s3_writer:
+    build:
+      context: ./services/bronze_s3_writer
+    container_name: bronze_s3_writer
+    environment:
+      # Disable output buffering for real-time logs
+      PYTHONUNBUFFERED: "1"
+
+      # Kafka connection settings
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: shots_raw
+      KAFKA_GROUP_ID: bronze-s3-writer
+
+      # AWS credentials and region (loaded from host environment)
+      AWS_REGION: ${AWS_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+
+      # S3 prefix representing the bronze data layer
+      S3_PREFIX: bronze/shots_raw
+
+      # Batch size and time-based flush configuration
+      BATCH_SIZE: 500
+      FLUSH_SECONDS: 10
+    depends_on:
+      # Ensure Kafka is running before consumer starts
+      - kafka
+
