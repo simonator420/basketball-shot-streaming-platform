@@ -1,0 +1,4 @@
+catalog = "workspace_ingestion_data"
+schema = "analytics"
+default_refresh_seconds = 30
+default_days_back = 7
