@@ -30,5 +30,3 @@ st.write("Use the left menu to open a dashboard page (Game / Player / Shot Chart
 if auto_refresh:
     time.sleep(30)
     st.rerun()
-    
-

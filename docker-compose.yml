@@ -58,20 +58,17 @@ services:
     environment:
       # Kafka bootstrap server inside Docker network
       KAFKA_BOOTSTRAP: kafka:9092
-      # Target Kafka topic for raw events
       KAFKA_TOPIC: shots_raw
-
-      # MySQL connection
       MYSQL_HOST: host.docker.internal
       MYSQL_PORT: 8889
       MYSQL_USER: root
       MYSQL_PASSWORD: root
       MYSQL_DATABASE: basketball_optimalization
+      PYTHONUNBUFFERED: "1"
 
     depends_on:
-      # Ensure Kafka is running before producer starts
-      - kafka
-      - bronze_s3_writer
+      kafka:
+        condition: service_started
     restart: "no"
   
   # Consumes raw events from Kafka and writes them to S3
@@ -81,25 +78,96 @@ services:
       context: ./services/bronze_s3_writer
     container_name: bronze_s3_writer
     environment:
-      # Disable output buffering for real-time logs
       PYTHONUNBUFFERED: "1"
-
-      # Kafka connection settings
       KAFKA_BOOTSTRAP: kafka:9092
       KAFKA_TOPIC: shots_raw
       KAFKA_GROUP_ID: bronze-s3-writer
-
-      # AWS credentials and region (loaded from host environment)
       AWS_REGION: ${AWS_REGION}
       S3_BUCKET: ${S3_BUCKET}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-
-      # S3 prefix representing the bronze data layer
       S3_PREFIX: bronze/shots_raw
-
+      # If writer also touches MySQL, keep these:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: pipeline
+      MYSQL_PASSWORD: pipeline
+      MYSQL_DATABASE: basketball_optimalization
     depends_on:
-      # Ensure Kafka is running before consumer starts
-      - kafka
+      kafka:
+        condition: service_started
+      mysql:
+        condition: service_healthy
     restart: "no"
 
+  airflow-postgres:
+    image: postgres:15
+    user: "0:0"
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_pgdata:/var/lib/postgresql/data
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: basketball_optimalization
+      MYSQL_USER: pipeline
+      MYSQL_PASSWORD: pipeline
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  airflow:
+    build:
+      context: ./airflow
+    depends_on:
+      airflow-postgres:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    env_file:
+      - ./airflow/.env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      DATABRICKS_CLUSTER_ID: 0203-015823-an9cos24
+      AWS_REGION: ${AWS_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./:/opt/airflow/project
+    ports:
+      - "8080:8080"
+    command: >
+      bash -lc "
+      airflow db init &&
+      airflow users create
+        --username admin
+        --password admin
+        --firstname Admin
+        --lastname Admin
+        --role Admin
+        --email admin@example.com || true;
+      airflow scheduler & exec airflow webserver
+      "
+
+volumes:
+  airflow_pgdata:
+  mysql_data:
