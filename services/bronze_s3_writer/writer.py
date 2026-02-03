@@ -1,6 +1,5 @@
 import os
 import json
-import time
 from datetime import datetime, timezone
 
 import boto3
@@ -17,16 +16,8 @@ AWS_REGION = os.getenv("AWS_REGION")
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_PREFIX = os.getenv("S3_PREFIX", "bronze/shots_raw")
 
-# Batching & flushing configuration
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
-FLUSH_SECONDS = int(os.getenv("FLUSH_SECONDS", "10"))
-
 
 def validate_env():
-    """
-    Validate that required environment variables are set.
-    Fail fast if critical AWS configuration is missing.
-    """
     missing = []
     for k in ["AWS_REGION", "S3_BUCKET"]:
         if not os.getenv(k):
@@ -35,127 +26,137 @@ def validate_env():
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
 
-def make_s3_key():
+def make_s3_key(game_id: int, run_id: int):
     """
-    Generate an S3 object key using UTC timestamp.
-    The structure follows a bronze data lake layout with date partitioning.
-
+    One file per run (per game).
     Example:
-    bronze/shots_raw/date=2026-01-28/part-20260128_120501_123456.jsonl
+    bronze/shots_raw/game_id=1/run_id=17/date=2026-02-02/shots.jsonl
     """
     dt = datetime.now(timezone.utc)
     date = dt.strftime("%Y-%m-%d")
-    ts = dt.strftime("%Y%m%d_%H%M%S_%f")
-    return f"{S3_PREFIX}/date={date}/part-{ts}.jsonl"
+    return f"{S3_PREFIX}/game_id={game_id}/run_id={run_id}/date={date}/shots.jsonl"
 
 
 def main():
-    """
-    Main consumer loop:
-    - Read messages from Kafka
-    - Buffer them in memory
-    - Periodically flush them to S3 as JSON Lines (NDJSON)
-    - Commit Kafka offsets only after successful S3 upload
-    """
-    
-    # Ensure required environment variables are present
     validate_env()
 
-    # Initialize S3 client
     s3 = boto3.client("s3", region_name=AWS_REGION)
 
-    # Initialize Kafka consumer
     c = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
         "group.id": GROUP_ID,
-        # Start from earliest offset if no committed offset exists
         "auto.offset.reset": AUTO_OFFSET_RESET,
-        # Disable auto commit to control delivery guarantees
         "enable.auto.commit": False,
     })
-    
-    # Subscribe to the Kafka topic
+
     c.subscribe([TOPIC])
 
-    # In-memory buffer for batching messages before upload
-    buffer = []
-    last_flush = time.time()
-    
-    # Startup logs
     print(f"[bronze-s3-writer] Kafka={KAFKA_BOOTSTRAP} topic={TOPIC} group={GROUP_ID}")
     print(f"[bronze-s3-writer] S3=s3://{S3_BUCKET}/{S3_PREFIX}/... region={AWS_REGION}")
-    print(f"[bronze-s3-writer] batch={BATCH_SIZE} flush_seconds={FLUSH_SECONDS}")
+    print("[bronze-s3-writer] Mode=ONE_FILE_PER_RUN (upload on RUN_END)")
+
+    current_run_id = None
+    current_game_id = None
+    shots_written = 0
+    tmp_path = None
+    f = None
 
     try:
         while True:
-            # Poll Kafka for new messages
             msg = c.poll(1.0)
-            now = time.time()
+            if msg is None:
+                continue
 
-            if msg is not None:
-                if msg.error():
-                    print(f"Kafka error: {msg.error()}")
-                else:
-                    # Decode message payload
-                    raw = msg.value().decode("utf-8")
-                    
-                    # Sanity check, ensure valid JSON
-                    json.loads(raw)
-                    
-                    # Add raw JSON string to buffer
-                    buffer.append(raw)
+            if msg.error():
+                print(f"Kafka error: {msg.error()}")
+                continue
 
-            # Decide whether to flush buffer to S3:
-            # 1) buffer size threshold reached OR
-            # 2) time-based flush interval exceeded
-            should_flush = (len(buffer) >= BATCH_SIZE) or (buffer and (now - last_flush) >= FLUSH_SECONDS)
+            raw = msg.value().decode("utf-8")
+            event = json.loads(raw)
+            etype = event.get("type", "SHOT")
 
-            if should_flush:
-                # Generate unique S3 object key
-                key = make_s3_key()
-                
-                # Join messages as newline-delimited JSON
-                body = ("\n".join(buffer) + "\n").encode("utf-8")
+            if etype == "SHOT":
+                if current_run_id is None:
+                    current_run_id = int(event["run_id"])
+                    current_game_id = int(event["game_id"])
 
-                # Upload batch to S3
-                s3.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=key,
-                    Body=body,
-                    ContentType="application/x-ndjson",
-                )
+                    # local temp file for this run
+                    tmp_path = f"/tmp/shots_run_{current_run_id}.jsonl"
+                    f = open(tmp_path, "w", encoding="utf-8")
+
+                    print(f"[bronze-s3-writer] Started run_id={current_run_id} game_id={current_game_id}")
+                    print(f"[bronze-s3-writer] Writing temp file: {tmp_path}")
+
+                # Fail fast if mixed runs arrive (should not happen in this design)
+                if int(event["run_id"]) != current_run_id:
+                    raise RuntimeError(
+                        f"Received run_id={event['run_id']} but current_run_id={current_run_id}. "
+                        "Mixed runs in one writer execution are not supported."
+                    )
+
+                # Write exactly what came from Kafka as NDJSON line
+                f.write(raw + "\n")
+                shots_written += 1
+
+            elif etype == "RUN_END":
+                rid = int(event["run_id"])
+                gid = int(event["game_id"])
+                expected = int(event.get("shots_sent", -1))
+
+                # If RUN_END comes first, initialize anyway (rare)
+                if current_run_id is None:
+                    current_run_id = rid
+                    current_game_id = gid
+                    tmp_path = f"/tmp/shots_run_{current_run_id}.jsonl"
+                    f = open(tmp_path, "w", encoding="utf-8")
+
+                if rid != current_run_id:
+                    raise RuntimeError(f"RUN_END run_id={rid} != current_run_id={current_run_id}")
+
+                print(f"[bronze-s3-writer] RUN_END received run_id={rid} expected={expected} written={shots_written}")
+
+                # Close file before upload
+                f.flush()
+                f.close()
+
+                # Upload exactly one object for this run
+                key = make_s3_key(current_game_id, current_run_id)
+                with open(tmp_path, "rb") as rf:
+                    s3.put_object(
+                        Bucket=S3_BUCKET,
+                        Key=key,
+                        Body=rf,
+                        ContentType="application/x-ndjson",
+                    )
 
                 # Commit offsets only after successful upload
                 c.commit(asynchronous=False)
 
-                print(f"Uploaded {len(buffer)} msgs -> s3://{S3_BUCKET}/{key} and committed offsets.")
-                
-                # Reset buffer and flush timer
-                buffer.clear()
-                last_flush = now
+                print(f"[bronze-s3-writer] Uploaded ONE file -> s3://{S3_BUCKET}/{key}")
+                print("[bronze-s3-writer] Offsets committed. Exiting.")
+
+                break
 
     except KeyboardInterrupt:
         print("Stopping...")
 
     finally:
-        # Best-effort flush of remaining messages on shutdown
-        if buffer:
-            try:
-                # Generate a unique S3 object key
-                key = make_s3_key()
-                # Convert buffered Kafka messages
-                body = ("\n".join(buffer) + "\n").encode("utf-8")
-                # Upload the batch to S3 as a single object
-                # This represents durable storage in the bronze data layer
-                s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body, ContentType="application/x-ndjson")
-                # Commit Kafka offsets only after successful upload to S3
-                c.commit(asynchronous=False)
-                print(f"Uploaded final {len(buffer)} msgs -> s3://{S3_BUCKET}/{key} and committed offsets.")
-            except Exception as e:
-                print(f"Final flush failed: {e}")
-        # Close Kafka consumer cleanly
+        try:
+            if f and not f.closed:
+                f.close()
+        except Exception:
+            pass
+
+        # Best-effort cleanup temp file
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
         c.close()
         print("Done")
+
 
 if __name__ == "__main__":
     main()

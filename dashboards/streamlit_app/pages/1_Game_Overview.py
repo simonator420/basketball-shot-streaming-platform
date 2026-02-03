@@ -3,13 +3,14 @@ from utils.db import sql_to_pandas
 
 st.title("📊 Game overview")
 
-dates = sql_to_pandas("""
-    SELECT DISTINCT date
+runs = sql_to_pandas("""
+    SELECT DISTINCT run_id
     FROM workspace_ingestion_data.analytics.game_stats
-    ORDER BY date DESC
-""")["date"].tolist()
+    ORDER BY run_id DESC
+""")["run_id"].tolist()
 
-selected_date = st.sidebar.selectbox("Date", dates)
+selected_run = st.sidebar.selectbox("Run", runs)
+
 
 kpi = sql_to_pandas(f"""
     SELECT
@@ -18,8 +19,9 @@ kpi = sql_to_pandas(f"""
       SUM(total_shots) AS shots,
       AVG(overall_shooting_percentage)*100 AS fg_pct
     FROM workspace_ingestion_data.analytics.game_stats
-    WHERE date = DATE('{selected_date}')
+    WHERE run_id = {int(selected_run)}
 """).iloc[0]
+
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Games", int(kpi["games"] or 0))
@@ -34,12 +36,14 @@ df = sql_to_pandas(f"""
       total_shots,
       overall_shooting_percentage,
       avg_shot_distance,
-      unique_players
+      unique_players,
+      last_updated
     FROM workspace_ingestion_data.analytics.game_stats
-    WHERE date = DATE('{selected_date}')
+    WHERE run_id = {int(selected_run)}
     ORDER BY total_points DESC
     LIMIT 100
 """)
+
 
 st.subheader("Games")
 st.dataframe(df, use_container_width=True)

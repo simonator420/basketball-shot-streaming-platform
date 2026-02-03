@@ -68,11 +68,11 @@ services:
       MYSQL_PASSWORD: root
       MYSQL_DATABASE: basketball_optimalization
 
-      # Limit number of rows read per run
-      LIMIT_ROWS: 100
     depends_on:
       # Ensure Kafka is running before producer starts
       - kafka
+      - bronze_s3_writer
+    restart: "no"
   
   # Consumes raw events from Kafka and writes them to S3
   # as newline-delimited JSON in a bronze data layer
@@ -98,10 +98,8 @@ services:
       # S3 prefix representing the bronze data layer
       S3_PREFIX: bronze/shots_raw
 
-      # Batch size and time-based flush configuration
-      BATCH_SIZE: 500
-      FLUSH_SECONDS: 10
     depends_on:
       # Ensure Kafka is running before consumer starts
       - kafka
+    restart: "no"
 

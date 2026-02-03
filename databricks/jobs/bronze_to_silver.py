@@ -13,37 +13,95 @@ from databricks.connect import DatabricksSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, LongType, StringType, DoubleType
 from datetime import datetime
+import re
+import boto3
+from pyspark.sql.utils import AnalysisException
 
 # Initialize Spark session with serverless compute
 spark = DatabricksSession.builder.serverless(True).getOrCreate()
 
-BRONZE_PATH = "s3://basketball-shot-lakehouse-simon/bronze/shots_raw/"
+BRONZE_ROOT = "s3://basketball-shot-lakehouse-simon/bronze/shots_raw/"
 SILVER_PATH = "s3://basketball-shot-lakehouse-simon/silver/shots_processed/"
 
 # Define explicit schema for Bronze JSONL data to ensure type safety
 bronze_schema = StructType([
+    StructField("type", StringType(), True),
+    StructField("run_id", LongType(), True),
     StructField("event_id", LongType(), True),
     StructField("game_id", LongType(), True),
     StructField("period", LongType(), True),
     StructField("player_id", LongType(), True),
-    StructField("result", LongType(), True),  # 0 = miss, 1 = made
-    StructField("score_after_shot", StringType(), True),  # Format: "XX - YY"
+    StructField("result", LongType(), True),
+    StructField("score_after_shot", StringType(), True),
     StructField("score_diff_after", LongType(), True),
     StructField("score_diff_before", LongType(), True),
-    StructField("shot_type", StringType(), True),  # "2pt" or "3pt"
-    StructField("time", StringType(), True),  # Format: "MM:SS"
-    StructField("x", DoubleType(), True),  # Court x-coordinate
-    StructField("y", DoubleType(), True),  # Court y-coordinate
+    StructField("shot_type", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("x", DoubleType(), True),
+    StructField("y", DoubleType(), True),
+    StructField("emitted_at", StringType(), True),
 ])
 
-print("\nReading data from Bronze layer...")
+def latest_run_path(bronze_root: str) -> str:
+    """
+    Terminal-friendly: find latest run_id in S3 using boto3 list_objects_v2.
 
-df_bronze = spark.read \
-    .schema(bronze_schema) \
-    .json(BRONZE_PATH)
+    Expects keys like:
+    bronze/shots_raw/game_id=1/run_id=17/date=2026-02-02/shots.jsonl
+
+    Returns:
+    s3://bucket/bronze/shots_raw/game_id=<gid>/run_id=<rid>/
+    """
+    m = re.match(r"^s3://([^/]+)/(.+)$", bronze_root.rstrip("/") + "/")
+    if not m:
+        raise ValueError(f"Invalid S3 path: {bronze_root}")
+    bucket = m.group(1)
+    prefix = m.group(2)
+
+    s3 = boto3.client("s3")
+
+    paginator = s3.get_paginator("list_objects_v2")
+
+    best = None  # tuple (run_id, game_id)
+
+    run_re = re.compile(r"game_id=(\d+)/run_id=(\d+)/")
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            m2 = run_re.search(key)
+            if not m2:
+                continue
+            gid = int(m2.group(1))
+            rid = int(m2.group(2))
+            if best is None or rid > best[0]:
+                best = (rid, gid)
+
+    if best is None:
+        raise RuntimeError(f"No run_id found under {bronze_root}")
+
+    rid, gid = best
+    return f"s3://{bucket}/{prefix}game_id={gid}/run_id={rid}/"
+
+print("\n[bronze_to_silver] Discovering latest run in Bronze...")
+BRONZE_PATH = latest_run_path(BRONZE_ROOT)
+print(f"[bronze_to_silver] Latest run path: {BRONZE_PATH}")
+
+print("\n[bronze_to_silver] Reading Bronze JSONL...")
+df_bronze = (
+    spark.read
+        .schema(bronze_schema)
+        .json(BRONZE_PATH)
+        .filter(F.col("type") == F.lit("SHOT"))
+)
 
 bronze_count = df_bronze.count()
-print(f"Loaded {bronze_count:,} records from Bronze")
+print(f"[bronze_to_silver] Loaded {bronze_count:,} SHOT records from Bronze")
+
+print("[bronze_to_silver] Distinct run/game/date found:")
+df_bronze.select("run_id", "game_id").dropDuplicates().show(truncate=False)
+
+df_bronze.printSchema()
 
 # Apply transformations
 df_silver = df_bronze \
@@ -101,14 +159,23 @@ df_silver.groupBy("shot_type", "shot_made") \
     .count() \
     .orderBy("shot_type", "shot_made") \
     .show()
+    
+try:
+    spark.read.format("delta").load(SILVER_PATH)
+    run_meta = df_silver.select("game_id", "run_id").dropDuplicates().collect()
+    game_id = int(run_meta[0]["game_id"])
+    run_id = int(run_meta[0]["run_id"])
+    spark.sql(f"DELETE FROM delta.`{SILVER_PATH}` WHERE game_id = {game_id} AND run_id = {run_id}")
+except Exception:
+    pass
 
 print("\nWriting to Silver layer...")
 
+
 df_silver.write \
     .format("delta") \
-    .mode("overwrite") \
-    .partitionBy("date") \
-    .option("overwriteSchema", "true") \
+    .mode("append") \
+    .partitionBy("game_id", "run_id") \
     .option("mergeSchema", "true") \
     .save(SILVER_PATH)
 
