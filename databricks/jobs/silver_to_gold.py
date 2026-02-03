@@ -16,7 +16,8 @@ import re
 import boto3
 
 # Initialize Spark session with serverless compute
-spark = DatabricksSession.builder.serverless(True).getOrCreate()
+# spark = DatabricksSession.builder.serverless(True).getOrCreate()
+spark = DatabricksSession.builder.getOrCreate()
 
 SILVER_PATH = "s3://basketball-shot-lakehouse-simon/silver/shots_processed/"
 GOLD_PATH = "s3://basketball-shot-lakehouse-simon/gold/"

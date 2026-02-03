@@ -12,3 +12,6 @@ databricks/jobs/s3_test.py
 
 # terraform
 /terraform/terraform.tfvars
+
+# airflow
+airflow/logs

@@ -11,7 +11,6 @@ print("[bronze_to_silver] cluster_id=" + os.getenv("DATABRICKS_CLUSTER_ID", "MIS
 
 # IMPORTANT:
 # - Airflow container must have access to docker CLI + docker socket.
-#   If you don't have it yet, we'll add it in the next step.
 # - These commands run on the Docker host via docker CLI.
 
 with DAG(

@@ -18,7 +18,8 @@ import boto3
 from pyspark.sql.utils import AnalysisException
 
 # Initialize Spark session with serverless compute
-spark = DatabricksSession.builder.serverless(True).getOrCreate()
+# spark = DatabricksSession.builder.serverless(True).getOrCreate()
+spark = DatabricksSession.builder.getOrCreate()
 
 BRONZE_ROOT = "s3://basketball-shot-lakehouse-simon/bronze/shots_raw/"
 SILVER_PATH = "s3://basketball-shot-lakehouse-simon/silver/shots_processed/"
